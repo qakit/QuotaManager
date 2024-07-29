@@ -1,0 +1,24 @@
+# use glob syntax
+syntax: glob
+
+# Ignore folders
+build/
+testrunner/
+[Oo]bj/
+[Bb]in/
+[Bb]ackup/
+_ReSharper*/
+_UpgradeReport*
+
+# NuGet Packages Directory
+packages
+
+# ignore other bs
+*.~?~
+.DS_Store
+*.swp
+TestResult.*
+.vs/
+.ionide/
+.idea/
+Logs/
