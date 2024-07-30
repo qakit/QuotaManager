@@ -1,6 +1,7 @@
 using ProxyKit;
 using Serilog;
-using Serilog.Events;
+using GridQuota;
+using Microsoft.Extensions.Options;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -12,34 +13,54 @@ builder.Configuration
 
 // Configure Serilog
 Log.Logger = new LoggerConfiguration()
+    .MinimumLevel.Information()
     .ReadFrom.Configuration(builder.Configuration)
     .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
     .Enrich.FromLogContext()
-    .Enrich.WithProperty("SourceContext", "")
     .WriteTo.Debug()
     .CreateLogger();
 
 builder.Host.UseSerilog();
 
 // Add services to the container.
-//builder.Services.Configure<RouterConfig>(builder.Configuration.GetSection("router"));
+builder.Services.Configure<AppConfig>(builder.Configuration.GetSection("app"));
 builder.Services.AddControllers();
 builder.Services.AddRazorPages();
 
-builder.Services.AddProxy();
-// builder.Services.AddSingleton<SessionHandler>();
-// builder.Services.AddSingleton<ILoadBalancer, RoundRobinBalancer>();
-// builder.Services.AddHostedService<BalancerLifecycleService>();
+builder.Services.AddProxy(httpClientBuilder => httpClientBuilder.UseSocketsHttpHandler());
+builder.Services.AddSingleton<SessionHandler>();
+builder.Services.AddSingleton<QuotaManager>();
+builder.Services.AddSingleton<IWorkerPool>(sp => sp.GetRequiredService<QuotaManager>());;
+builder.Services.AddSingleton<IWorkerRegistry>(sp => sp.GetRequiredService<QuotaManager>());
+builder.Services.AddHostedService<LifecycleService>();
 builder.Services.AddHttpClient();
 builder.Services.AddControllers();
 
 var app = builder.Build();
 
-// Configure the HTTP request pipeline.
-if (app.Environment.IsDevelopment())
+app.Use((context, next) =>
 {
-    app.UseDeveloperExceptionPage();
-}
+    if (context.WebSockets.IsWebSocketRequest)
+    {
+        Log.Debug("(WS) WebSocket request received on path: {Path}", context.Request.Path);
+    }
+    return next(context);
+});
+
+app.UseWebSockets();
+
+app.UseWebSocketProxy(
+        context => {
+            Log.Debug("WebSocket request received. Path: {Path}, Protocol: {Protocol}, Origin: {Origin}",
+                context.Request.Path, context.WebSockets.WebSocketRequestedProtocols, context.Request.Headers["Origin"]);
+
+            var host = app.Services.GetRequiredService<IOptions<AppConfig>>().Value.Hosts.Single();
+            var hostUri = new Uri(host.HostUri);
+
+            return new Uri("ws://" + hostUri.Host + ":" + hostUri.Port);
+        },
+        options => options.AddXForwardedHeaders());
+
 
 app.UseSerilogRequestLogging(); // Add this line to log HTTP requests
 
@@ -48,8 +69,26 @@ app.UseStaticFiles();
 app.UseAuthorization();
 
 app.MapGet("/hello", () => "Hello World!");
+app.Map("/session", sessionHandler => sessionHandler.RunProxy<SessionHandler>());
+
+// Configure the HTTP request pipeline.
+if (app.Environment.IsDevelopment())
+{
+    app.UseDeveloperExceptionPage();
+}
+
 app.MapControllers();
 app.MapRazorPages();
+
+app.Lifetime.ApplicationStarted.Register(() =>
+{
+    Log.Information("Web server is running and bound to the following addresses:");
+    foreach (var address in app.Urls)
+    {
+        Log.Information(address);
+    }
+});
+
 
 app.Lifetime.ApplicationStopping.Register(() =>
 {
@@ -59,7 +98,6 @@ app.Lifetime.ApplicationStopping.Register(() =>
 
 try
 {
-    Log.Information("Starting web application");
     app.Run();
     return 0;
 }
