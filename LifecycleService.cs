@@ -3,171 +3,161 @@ using Microsoft.Extensions.Options;
 
 namespace GridQuota;
 
-public class LifecycleService : IHostedService
+public class LifecycleService(
+	IOptionsMonitor<AppConfig> _configOptions,
+	IWorkerRegistry _balancer,
+	IHttpClientFactory _clientFactory,
+	ILogger<LifecycleService> _logger,
+	SessionHandler _sessionHandler
+) : IHostedService
 {
-    private readonly IOptionsMonitor<AppConfig> _configOptions;
-    private readonly IWorkerRegistry _balancer;
-    private readonly IHttpClientFactory _clientFactory;
-    private readonly ILogger<LifecycleService> _logger;
-    private readonly SessionHandler _sessionHandler;
+	private readonly CancellationTokenSource _watchdogsCts = new();
+	private readonly IList<Task> _watchdogs = [];
+	private readonly List<IDisposable?> _disposables = [];
 
-    private readonly CancellationTokenSource _watchdogsCts = new CancellationTokenSource();
-    private readonly IList<Task> _watchdogs = new List<Task>();
+	private readonly AutoResetEvent _triggerReloadConfig = new(false);
 
-    private readonly AutoResetEvent _triggerReloadConfig = new AutoResetEvent(false);
+	public async Task ExpiredSessionsWatchdog(CancellationToken cancel)
+	{
+		while (!cancel.IsCancellationRequested)
+		{
+			try
+			{
+				await _sessionHandler.CleanupExpiredSessions();
+				await Task.Delay(1000, cancel);
+			}
+			catch (TaskCanceledException) { break; }
+		}
+	}
 
-    public LifecycleService(IOptionsMonitor<AppConfig> configOptions,
-        IWorkerRegistry balancer,
-        IHttpClientFactory clientFactory,
-        ILogger<LifecycleService> logger,
-        SessionHandler sessionHandler
-        )
-    {
-        _configOptions = configOptions;
-        _balancer = balancer;
-        _clientFactory = clientFactory;
-        _logger = logger;
-        _sessionHandler = sessionHandler;
-        configOptions.OnChange(_ =>
-        {
-            _logger.LogInformation($"Config has changed");
-            _triggerReloadConfig.Set();
-        });
-    }
+	public async Task HostReconfigWatchdog(CancellationToken cancel)
+	{
+		while (!cancel.IsCancellationRequested)
+		{
+			try
+			{
+				var awaitInterval = _configOptions.CurrentValue.CheckAliveInterval;
 
-    public async Task ExpiredSessionsWatchdog(CancellationToken cancel)
-    {
-        while (!cancel.IsCancellationRequested)
-        {
-            try
-            {
-                await _sessionHandler.CleanupExpiredSessions();
-                await Task.Delay(1000, cancel);
-            }
-            catch (TaskCanceledException) { break; }
-        }
-    }
+				await SyncConfig(cancel);
+				await Task.WhenAny(Task.Delay(awaitInterval, cancel), _triggerReloadConfig.AsTask());
+				_triggerReloadConfig.Reset();
+			}
+			catch (TaskCanceledException) { break; }
+		}
+	}
 
-    public async Task HostReconfigWatchdog(CancellationToken cancel)
-    {
-        while (!cancel.IsCancellationRequested)
-        {
-            try
-            {
-                var awaitInterval = _configOptions.CurrentValue.CheckAliveInterval;
+	public async Task StartAsync(CancellationToken cancellationToken)
+	{
+		_logger.LogInformation("Connecting hosts");
+		_logger.LogDebug("Current config: {Config}", JsonSerializer.Serialize(_configOptions.CurrentValue));
 
-                await SyncConfig(cancel);
-                await Task.WhenAny(Task.Delay(awaitInterval, cancel), _triggerReloadConfig.AsTask());
-                _triggerReloadConfig.Reset();
-            }
-            catch (TaskCanceledException) { break; }
-        }
-    }
+		await SyncConfig(cancellationToken);
+		_watchdogs.Add(
+			ExpiredSessionsWatchdog(_watchdogsCts.Token)
+		);
+		_watchdogs.Add(
+			HostReconfigWatchdog(_watchdogsCts.Token)
+		);
 
-    public async Task StartAsync(CancellationToken cancellationToken)
-    {
-        _logger.LogInformation("Connecting hosts");
-		_logger.LogDebug("Current config: {0}", JsonSerializer.Serialize(_configOptions.CurrentValue));
-        _logger.LogInformation("================");
+		_disposables.Add(
+			_configOptions.OnChange(_ =>
+			{
+				_logger.LogInformation($"Config has changed, reapplying");
+				_triggerReloadConfig.Set();
+			})
+		);
+	}
 
-        await SyncConfig(cancellationToken);
-        _watchdogs.Add(
-            ExpiredSessionsWatchdog(_watchdogsCts.Token)
-        );
-        _watchdogs.Add(
-            HostReconfigWatchdog(_watchdogsCts.Token)
-        );
-    }
+	private async Task SyncConfig(CancellationToken _)
+	{
+		var runningHosts = _balancer.GetConfig().ToDictionary(c => new Uri(c.HostUri), c => c);
+		var newConfig = _configOptions.CurrentValue;
+		var newHosts = newConfig.Hosts.ToDictionary(c => new Uri(c.HostUri), c => c);
 
-    private async Task SyncConfig(CancellationToken cancellationToken)
-    {
-        var runningHosts = _balancer.GetConfig().ToDictionary(c => new Uri(c.HostUri), c => c);
-        var newConfig = _configOptions.CurrentValue;
-        var newHosts = newConfig.Hosts.ToDictionary(c => new Uri(c.HostUri), c => c);
+		var hostsStatus = await CheckAliveStatus(from h in newConfig.Hosts select new Uri(h.HostUri));
+		Predicate<Uri> isAlive = uri =>
+			hostsStatus.TryGetValue(uri, out var x) && x
+			&& newHosts.TryGetValue(uri, out var config) && config.Limit > 0;
 
-        // TODO optimize alive-ness request
-        // var consideredAlive = _sessionHandler.GetAliveHosts(DateTimeOffset.Now - TimeSpan.FromSeconds(30));
+		var toBeRemoved =
+			(from host in runningHosts.Keys
+			 where !newHosts.ContainsKey(host) || !isAlive(host)
+			 select host).ToArray();
+		var toBeStarted =
+			(from host in newHosts.Keys
+			 where (!runningHosts.ContainsKey(host) || !AreConfigsEqual(newHosts[host], runningHosts[host])) && isAlive(host)
+			 select host).ToArray();
 
-        var hostsStatus = await CheckAliveStatus(from h in newConfig.Hosts select new Uri(h.HostUri));
-        Predicate<Uri> isAlive = uri =>
-            hostsStatus.TryGetValue(uri, out var x) && x
-            && newHosts.TryGetValue(uri, out var config) && config.Limit > 0;
+		if (toBeRemoved.Length != 0 || toBeStarted.Length != 0)
+		{
+			_logger.LogInformation("Detected changes in configuration or availability of the hosts");
+		}
 
-        var toBeRemoved =
-            (from host in runningHosts.Keys
-             where !newHosts.ContainsKey(host) || !isAlive(host)
-             select host).ToArray();
-        var toBeStarted =
-            (from host in newHosts.Keys
-             where (!runningHosts.ContainsKey(host) || !AreConfigsEqual(newHosts[host], runningHosts[host])) && isAlive(host)
-             select host).ToArray();
+		await Task.WhenAll(
+			from host in toBeRemoved
+			select _balancer.DeleteHost(host)
+			);
+		await Task.WhenAll(
+			from host in toBeStarted
+			select _balancer.AddHost(newHosts[host])
+			);
 
-        if (toBeRemoved.Any() || toBeStarted.Any())
-        {
-            _logger.LogInformation("Detected changes in configuration or availability of the hosts");
-        }
+		// TODO update status monitor queue
+		// if (hostsStatus.Any(status => status.Value == false))
+		// {
+		// 	var deadHosts = from h in newConfig.Hosts where !isAlive(h.HostUri) select h.HostUri;
+		// 	_logger.LogWarning("Hosts not available: {0}", string.Join(", ", deadHosts.ToArray()));
+		// }
+	}
 
-        await Task.WhenAll(
-            from host in toBeRemoved
-            select _balancer.DeleteHost(host)
-            );
-        await Task.WhenAll(
-            from host in toBeStarted
-            select _balancer.AddHost(newHosts[host])
-            );
+	private static bool AreConfigsEqual(HostConfig config1, HostConfig config2)
+	{
+		var json1 = JsonSerializer.Serialize(config1);
+		var json2 = JsonSerializer.Serialize(config2);
+		return json1 == json2;
+	}
 
-        // TODO update status monitor queue
-        // if (hostsStatus.Any(status => status.Value == false))
-        // {
-        // 	var deadHosts = from h in newConfig.Hosts where !isAlive(h.HostUri) select h.HostUri;
-        // 	_logger.LogWarning("Hosts not available: {0}", string.Join(", ", deadHosts.ToArray()));
-        // }
-    }
+	private async Task<IDictionary<Uri, bool>> CheckAliveStatus(IEnumerable<Uri> hosts)
+	{
+		static async Task<bool> Kick(Uri endpoint, HttpClient client, CancellationToken cancel)
+		{
+			try
+			{
+				return (await client.GetAsync(endpoint, cancel)).IsSuccessStatusCode;
+			}
+			catch (Exception)
+			{
+				return false;
+			}
+		}
 
-    private static bool AreConfigsEqual(HostConfig config1, HostConfig config2)
-    {
-        var json1 = JsonSerializer.Serialize(config1);
-        var json2 = JsonSerializer.Serialize(config2);
-        return json1 == json2;
-    }
+		using var httpCli = _clientFactory.CreateClient("checkalive");
+		using var cts = new CancellationTokenSource(2000);
 
-    private async Task<IDictionary<Uri, bool>> CheckAliveStatus(IEnumerable<Uri> hosts)
-    {
-        async Task<bool> Kick(Uri endpoint, HttpClient client, CancellationToken cancel)
-        {
-            try
-            {
-                return (await client.GetAsync(endpoint, cancel)).IsSuccessStatusCode;
-            }
-            catch (Exception)
-            {
-                return false;
-            }
-        }
+		var result = await Task.WhenAll(
+			from host in hosts
+			let statusUri = new Uri(host, "status")
+			select Kick(statusUri, httpCli, cts.Token).ContinueWith(task => new { host, alive = task.Result })
+		);
+		var hostsStatus = result.ToDictionary(v => v.host, v => v.alive);
+		return hostsStatus;
+	}
 
-        using var httpCli = _clientFactory.CreateClient("checkalive");
-        using var cts = new CancellationTokenSource(2000);
+	public async Task StopAsync(CancellationToken cancellationToken)
+	{
+		_logger.LogInformation("Stopping services");
 
-        var result = await Task.WhenAll(
-            from host in hosts
-            let statusUri = new Uri(host, "status")
-            select Kick(statusUri, httpCli, cts.Token).ContinueWith(task => new { host, alive = task.Result })
-        );
-        var hostsStatus = result.ToDictionary(v => v.host, v => v.alive);
-        return hostsStatus;
-    }
+		_disposables.ForEach(d => d?.Dispose());
+		_disposables.Clear();
+		
+		_watchdogsCts.Cancel();
 
-    public async Task StopAsync(CancellationToken cancellationToken)
-    {
-        _logger.LogInformation("Stopping services");
-        _watchdogsCts.Cancel();
-
-        var configs = _balancer.RunningHosts;
-        await Task.WhenAll(
-            configs.Select(host => _balancer.DeleteHost(host))
-            .Concat(new[] { _sessionHandler.TerminateAllSessions(cancellationToken) })
-            .Concat(_watchdogs)
-            );
-        _watchdogs.Clear();
-    }
+		var configs = _balancer.RunningHosts;
+		await Task.WhenAll(
+			configs.Select(_balancer.DeleteHost)
+			.Concat(new[] { _sessionHandler.TerminateAllSessions(cancellationToken) })
+			.Concat(_watchdogs)
+			);
+		_watchdogs.Clear();
+	}
 }

@@ -1,14 +1,14 @@
 using System.Collections.Concurrent;
-using System.Diagnostics.CodeAnalysis;
 using System.Threading.Channels;
+using Microsoft.Extensions.Options;
 
 namespace GridQuota;
 
-public class QuotaManager(ILogger<QuotaManager> logger, IHttpClientFactory clientFactory) : IWorkerPool, IWorkerRegistry
+public record HostData(Uri HostUri, HostConfig Config, CancellationTokenSource Cts, Task[] Runners);
+
+public class QuotaManager(ILogger<QuotaManager> _logger, IOptions<AppConfig> _appConfig) : IWorkerPool, IWorkerRegistry
 {
     const int MaxWorkerPerHost = 10000;
-
-    private static readonly TimeSpan WaitStoppingHostTimeout = TimeSpan.FromSeconds(3); // TODO to config
 
     private class Ticket(Request req)
     {
@@ -26,14 +26,9 @@ public class QuotaManager(ILogger<QuotaManager> logger, IHttpClientFactory clien
         }
     }
 
-    private record HostData(Uri HostUri, HostConfig Config, CancellationTokenSource Cts, Task[] Runners);
-
     private readonly Channel<Ticket> _queue = Channel.CreateUnbounded<Ticket>();
-    private readonly object _denialQueueLock = new object();
-    private readonly ILogger<QuotaManager> _logger = logger;
-    private readonly IHttpClientFactory _clientFactory = clientFactory;
 
-    private ConcurrentDictionary<Uri, HostData> _runningHosts = new();
+    private readonly ConcurrentDictionary<Uri, HostData> _runningHosts = new();
 
     public IEnumerable<Uri> RunningHosts => [.. _runningHosts.Keys];
 
@@ -41,7 +36,7 @@ public class QuotaManager(ILogger<QuotaManager> logger, IHttpClientFactory clien
     {
         var hostUri = new Uri(config.HostUri);
         await DeleteHost(hostUri);
-        _logger.LogInformation($"(Re)starting host '{hostUri}'");
+        _logger.LogInformation("Connecting to host/grid '{hostUri}'", hostUri);
 
         // start or updates tasks for a specific host
         var cts = new CancellationTokenSource();
@@ -55,22 +50,22 @@ public class QuotaManager(ILogger<QuotaManager> logger, IHttpClientFactory clien
     {
         if (_runningHosts.TryRemove(host, out var hostInfo))
         {
-            _logger.LogInformation($"Stopping host '{host}'");
+            _logger.LogInformation("Disconnecting from host/grid '{host}'", host);
             hostInfo.Cts.Cancel();
 
-            var timeout = Task.Delay(WaitStoppingHostTimeout);
+            var timeout = Task.Delay(_appConfig.Value.StopHostTimeout);
             var timeoutExpired = await Task.WhenAny(
                 timeout,
                 Task.WhenAll(hostInfo.Runners)) == timeout;
 
             if (timeoutExpired)
             {
-                _logger.LogError($"Failed to stop '{host}' gracefully");
+                _logger.LogError("Failed to stop '{host}' gracefully", host);
                 // TODO force stopping agent
             }
             else
             {
-                _logger.LogInformation($"Stopped host '{host}'");
+                _logger.LogInformation("Stopped host '{host}'", host);
             }
             return true;
         }
@@ -115,7 +110,7 @@ public class QuotaManager(ILogger<QuotaManager> logger, IHttpClientFactory clien
         }
         catch (TaskCanceledException)
         {
-            _logger.LogWarning($"Worker for '{hostUri}' cancelled");
+            _logger.LogWarning("Worker for '{Host}' cancelled", hostUri);
         }
         // queue is empty, quit the worker
     }

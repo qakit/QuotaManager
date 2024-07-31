@@ -13,7 +13,17 @@ public class AppConfig
 {
 	public List<HostConfig> Hosts { get; } = [];
 
-	// public TimeSpan Timeout { get; set; } = new TimeSpan(0, 0, 60);
+	/// <summary>
+	/// Timeout for stopping host (grid).
+	/// </summary>
+	public TimeSpan StopHostTimeout { get; set; } = new TimeSpan(0, 0, 3);
+
+	/// <summary>
+	/// How much time do we let session to be alive after connection. It used to be sliding expiration
+	/// since last access but with WebDriver v4 which uses websockets to communicate with the browser this is not possible.
+	/// </summary>
+	public TimeSpan SessionTimeout { get; set; } = new TimeSpan(0, 2, 0);
+
 	// public TimeSpan MaxTimeout { get; set; } = new TimeSpan(1, 0, 0);
 
 	public TimeSpan CheckAliveInterval { get; set; } = new TimeSpan(0, 0, 10);
