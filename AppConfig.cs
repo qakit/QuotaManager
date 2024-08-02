@@ -37,6 +37,6 @@ public class AppConfig
 	public TimeSpan CheckAliveInterval { get; set; } = new TimeSpan(0, 0, 10);
 
 	public int SessionRetryCount { get; set; } = 3;
-	public TimeSpan SessionRetryTimeout { get; set; } = new TimeSpan(0, 0, 30);
+	public TimeSpan SessionRetryTimeout { get; set; } = new TimeSpan(0, 0, 10);
 
 }

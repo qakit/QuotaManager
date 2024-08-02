@@ -6,8 +6,9 @@ using ProxyKit;
 
 namespace GridQuota;
 
-public record SessionData(Uri Upstream, Uri HostUri, ResourceToken<Uri> Worker, TimeSpan SessionTimeout)
+public record SessionData(Uri Upstream, Uri HostUri, ResourceToken<Uri> Worker, TimeSpan SessionTimeout, int userId)
 {
+	// TODO userId/appId
 	public UpstreamHost UpstreamHost { get; } = new UpstreamHost(Upstream.AbsoluteUri);
 }
 
@@ -15,7 +16,8 @@ public class SessionHandler(
 	ILogger<SessionHandler> _logger,
 	IWorkerPool<Uri> balancer,
 	IHttpClientFactory _factory,
-	IOptions<AppConfig> _appConfig) : IProxyHandler
+	QuotaManager quotas,
+	IOptions<AppConfig> config) : IProxyHandler
 {
 	/// <summary>
 	/// How much time does wait for remote session to be deleted after client dropped connection or session expired.
@@ -56,6 +58,10 @@ public class SessionHandler(
 			var response = await client.DeleteAsync(deleteSession, cancel);
 			_logger.LogDebug("Completed DELETE request with {0} code.", response.StatusCode);
 		}
+		catch (TaskCanceledException)
+		{
+			_logger.LogWarning("DELETE request to {0} was cancelled", deleteSession);
+		}
 		catch (Exception e)
 		{
 			_logger.LogError("sending DELETE to a '{0}' failed: {1}", deleteSession, e.Message);
@@ -67,7 +73,7 @@ public class SessionHandler(
 		if (context.Request.Path == "" && context.Request.Method == "POST")
 		{
 			_logger.LogDebug("Initiating new session (POST /session) from {RemoteIp}", context.Connection.RemoteIpAddress);
-			return await ProcessSessionRequest(context);
+			return await ProcessNewSessionRequest(context);
 		}
 
 		// Otherwise just forward request
@@ -113,6 +119,7 @@ public class SessionHandler(
 	{
 		if (_sessions.Remove(sessionId, out var sessionData))
 		{
+			quotas.ReleaseQuota(sessionData.userId);
 			sessionData.Worker.Dispose();
 			_sessionsExpires.Remove(sessionId, out var _);
 			// TODO consider _registry.ReleaseHost(sessionData.Host)
@@ -188,10 +195,10 @@ public class SessionHandler(
 			select pair.Key).ToList();
 	}
 
-	private async Task<HttpResponseMessage> ProcessSessionRequest(HttpContext context)
+	private async Task<HttpResponseMessage> ProcessNewSessionRequest(HttpContext context)
 	{
-		var retriesLeft = _appConfig.Value.SessionRetryCount;
-		var retryTimeout = _appConfig.Value.SessionRetryTimeout;
+		var retriesLeft = config.Value.SessionRetryCount;
+		var retryTimeout = config.Value.SessionRetryTimeout;
 
 		var userId = Authenticate(context);
 
@@ -204,6 +211,7 @@ public class SessionHandler(
 		}
 
 		var caps = new Caps();
+		await quotas.AwaitQuota(userId, context.RequestAborted);
 
 		do
 		{
@@ -211,11 +219,19 @@ public class SessionHandler(
 			var host = workerToken.Resource.AbsoluteUri;
 			var sessionEndpoint = new Uri(new Uri(host.TrimEnd('/') + "/"), "session");
 
-			var initResponse = await context
-				.ForwardTo(sessionEndpoint)
-				.AddXForwardedHeaders()
-				.Send();
-			if (initResponse.IsSuccessStatusCode)
+			HttpResponseMessage? initResponse = null;
+			try
+			{
+				initResponse = await context
+					.ForwardTo(sessionEndpoint)
+					.AddXForwardedHeaders()
+					.Send();
+			}
+			catch (Exception e)
+			{
+				_logger.LogError("Failed to forward request to {Host}: {Error}", host, e.Message);
+			}
+			if (initResponse != null && initResponse.IsSuccessStatusCode)
 			{
 				var responseBody = await initResponse.Content.ReadAsStringAsync();
 				var seleniumResponse = JsonDocument.Parse(responseBody);
@@ -230,18 +246,24 @@ public class SessionHandler(
 					initResponse.Content = new StringContent(updatedBody, Encoding.UTF8, "application/json");
 				}
 
-				_sessions.Add(sessionId, new SessionData(sessionEndpoint, workerToken.Resource, workerToken, _appConfig.Value.SessionTimeout));
+				_sessions.Add(sessionId, new SessionData(sessionEndpoint, workerToken.Resource, workerToken, config.Value.SessionTimeout, userId));
 				Touch(sessionId, workerToken.Resource);
 				return initResponse;
 			}
 			else if (--retriesLeft <= 0)
 			{
 				_logger.LogError("Failed to process /session request after 3 retries");
+				quotas.ReleaseQuota(userId);
+
+				if(initResponse == null)
+				{
+					return new HttpResponseMessage(System.Net.HttpStatusCode.InternalServerError);
+				}
 				return initResponse;
 			}
 			else
 			{
-				_logger.LogWarning("Failed to get response from {Host}, retrying in 10s", workerToken.Resource);
+				_logger.LogWarning("Failed to get response from {Host}, retrying in {RetryTimeout}s", workerToken.Resource, retryTimeout.TotalSeconds);
 				workerToken.Dispose();
 				// TODO host seems to become inactive, consider _registry.ReleaseHost(worker);
 				await Task.Delay(retryTimeout);
@@ -268,7 +290,7 @@ public class SessionHandler(
 		}
 
 		// Get the Base64 encoded part (after "Basic ")
-		string base64Credentials = authHeader.Substring("Basic ".Length).Trim();
+		string base64Credentials = authHeader["Basic ".Length..].Trim();
 
 		// Decode the Base64 string
 		string credentials = Encoding.UTF8.GetString(Convert.FromBase64String(base64Credentials));
@@ -284,7 +306,7 @@ public class SessionHandler(
 		string username = credentials.Substring(0, separatorIndex);
 		string password = credentials.Substring(separatorIndex + 1);
 
-		var users = _appConfig.Value.Users;
+		var users = config.Value.Users;
 		var userId = users.FindIndex(u => u.Name == username);
 
 		if (userId <= 0)
