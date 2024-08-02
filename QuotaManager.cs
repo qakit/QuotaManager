@@ -5,6 +5,9 @@ using Microsoft.Extensions.Options;
 namespace GridQuota;
 
 public record HostData(Uri HostUri, HostConfig Config, CancellationTokenSource Cts, Task[] Runners);
+
+#region statistics data
+
 public class UserStats(int maxSessions)
 {
 	private int _sessions = 0;
@@ -15,6 +18,12 @@ public class UserStats(int maxSessions)
 	public void AddSession() => Interlocked.Increment(ref _sessions);
 	public void DecSession() => Interlocked.Decrement(ref _sessions);
 }
+
+public record UserStatsPayload(string Name, int ActiveSessions, int MaxSessions);
+
+public record ManagerStatsPayload(UserStatsPayload[] Users, int QueueLength, int RunningHosts, Uri[] Hosts);
+
+#endregion
 
 public class QuotaManager(ILogger<QuotaManager> _logger, IOptions<AppConfig> _appConfig) : IWorkerPool<Uri>, IWorkerRegistry
 {
@@ -97,6 +106,19 @@ public class QuotaManager(ILogger<QuotaManager> _logger, IOptions<AppConfig> _ap
 	public HostConfig[] GetConfig() => _runningHosts.Values.Select(h => h.Config).ToArray();
 
 	#endregion
+
+	public ManagerStatsPayload GetStats()
+	{
+		var users = _userStats.Select((u, i) => new UserStatsPayload(_appConfig.Value.Users[i].Name, u.Sessions, u.MaxSessions)).ToArray();
+
+		var stats = new ManagerStatsPayload(
+			users,
+			_queue.Reader.Count,
+			_runningHosts.Count,
+			_runningHosts.Keys.ToArray()
+		);
+		return stats;
+	}
 
 	private Task[] StartHost(HostConfig config, CancellationToken cancel)
 	{

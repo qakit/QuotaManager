@@ -13,7 +13,7 @@ public class UserConfig
 {
 	public string Name { get; set; } = "";
 	public string Secret { get; set; } = "";
-	public int MaxSessions { get; set; } = 20;
+	public int MaxSessions { get; set; } = 5;
 }
 
 public class AppConfig

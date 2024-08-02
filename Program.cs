@@ -73,6 +73,12 @@ app.UseAuthorization();
 
 app.Map("/session", appBuilder => appBuilder.RunProxy<SessionHandler>());
 
+app.MapGet("/stats", (QuotaManager manager) =>
+{
+	var stats = manager.GetStats();
+	return Results.Json(stats);
+});
+
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
 {
