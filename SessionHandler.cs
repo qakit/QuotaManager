@@ -6,14 +6,14 @@ using ProxyKit;
 
 namespace GridQuota;
 
-public record SessionData(Uri Upstream, Uri HostUri, Worker Worker, TimeSpan SessionTimeout)
+public record SessionData(Uri Upstream, Uri HostUri, ResourceToken<Uri> Worker, TimeSpan SessionTimeout)
 {
 	public UpstreamHost UpstreamHost { get; } = new UpstreamHost(Upstream.AbsoluteUri);
 }
 
 public class SessionHandler(
 	ILogger<SessionHandler> _logger,
-	IWorkerPool balancer,
+	IWorkerPool<Uri> balancer,
 	IHttpClientFactory _factory,
 	IOptions<AppConfig> _appConfig) : IProxyHandler
 {
@@ -22,7 +22,7 @@ public class SessionHandler(
 	/// </summary>
 	private const int DeleteSessionTimeoutMs = 4000;
 
-	private readonly IWorkerPool _balancer = balancer;
+	private readonly IWorkerPool<Uri> _balancer = balancer;
 
 	private readonly IDictionary<string, SessionData> _sessions = new ConcurrentDictionary<string, SessionData>();
 	private readonly ConcurrentDictionary<string, DateTimeOffset> _sessionsExpires = new();
@@ -193,6 +193,8 @@ public class SessionHandler(
 		var retriesLeft = _appConfig.Value.SessionRetryCount;
 		var retryTimeout = _appConfig.Value.SessionRetryTimeout;
 
+		var userId = Authenticate(context);
+
 		var body = await ReadRequestBody(context);
 		_logger.LogDebug("Request body: {Body}", body);
 
@@ -205,8 +207,9 @@ public class SessionHandler(
 
 		do
 		{
-			var worker = await _balancer.GetNext(new Request(caps));
-			var sessionEndpoint = new Uri(new Uri(worker.Host.AbsoluteUri.TrimEnd('/') + "/"), "session");
+			var workerToken = await _balancer.GetNext(new Request(caps, userId));
+			var host = workerToken.Resource.AbsoluteUri;
+			var sessionEndpoint = new Uri(new Uri(host.TrimEnd('/') + "/"), "session");
 
 			var initResponse = await context
 				.ForwardTo(sessionEndpoint)
@@ -219,7 +222,7 @@ public class SessionHandler(
 				var sessionId = seleniumResponse.RootElement.GetProperty("value").GetProperty("sessionId")
 					.GetString() ?? "";
 
-				_logger.LogInformation("New session for {Remote}: {SessionId} on host '{WorkerHost}'", context.Connection.RemoteIpAddress, sessionId, worker.Host);
+				_logger.LogInformation("New session for {Remote} user {User}: {SessionId} on host '{WorkerHost}'", context.Connection.RemoteIpAddress, userId, sessionId, workerToken.Resource);
 
 				var updatedBody = FixupInitResponse(responseBody, context.Connection);
 				if (updatedBody != responseBody)
@@ -227,8 +230,8 @@ public class SessionHandler(
 					initResponse.Content = new StringContent(updatedBody, Encoding.UTF8, "application/json");
 				}
 
-				_sessions.Add(sessionId, new SessionData(sessionEndpoint, worker.Host, worker, _appConfig.Value.SessionTimeout));
-				Touch(sessionId, worker.Host);
+				_sessions.Add(sessionId, new SessionData(sessionEndpoint, workerToken.Resource, workerToken, _appConfig.Value.SessionTimeout));
+				Touch(sessionId, workerToken.Resource);
 				return initResponse;
 			}
 			else if (--retriesLeft <= 0)
@@ -238,12 +241,63 @@ public class SessionHandler(
 			}
 			else
 			{
-				_logger.LogWarning("Failed to get response from {Host}, retrying in 10s", worker.Host);
-				worker.Dispose();
+				_logger.LogWarning("Failed to get response from {Host}, retrying in 10s", workerToken.Resource);
+				workerToken.Dispose();
 				// TODO host seems to become inactive, consider _registry.ReleaseHost(worker);
 				await Task.Delay(retryTimeout);
 			}
 		} while (true);
+	}
+
+
+	/// <summary>
+	/// Ensures user had provided valid credentials. Returns 0 if user is not authenticated or positive integer if user is authenticated.
+	/// </summary>
+	/// <param name="context"></param>
+	/// <param name="users"></param>
+	/// <returns></returns>
+	/// <exception cref="NotImplementedException"></exception>
+	private int Authenticate(HttpContext context)
+	{
+		string? authHeader = context.Request.Headers["Authorization"];
+
+		// Check if the header is present and starts with "Basic"
+		if (string.IsNullOrEmpty(authHeader) || !authHeader.StartsWith("Basic ", StringComparison.OrdinalIgnoreCase))
+		{
+			return 0;
+		}
+
+		// Get the Base64 encoded part (after "Basic ")
+		string base64Credentials = authHeader.Substring("Basic ".Length).Trim();
+
+		// Decode the Base64 string
+		string credentials = Encoding.UTF8.GetString(Convert.FromBase64String(base64Credentials));
+
+		// Split the credentials into username and password
+		int separatorIndex = credentials.IndexOf(':');
+		if (separatorIndex < 0)
+		{
+			_logger.LogWarning("Failed to parse credentials '{credentials}' from '{authHeader}'", credentials, authHeader);
+			return 0;
+		}
+
+		string username = credentials.Substring(0, separatorIndex);
+		string password = credentials.Substring(separatorIndex + 1);
+
+		var users = _appConfig.Value.Users;
+		var userId = users.FindIndex(u => u.Name == username);
+
+		if (userId <= 0)
+		{
+			_logger.LogWarning("User '{user}' not found", username);
+			return 0;
+		}
+		if (users[userId].Secret != password)
+		{
+			_logger.LogWarning("Wrong name or password '{user}'", username);
+			return 0;
+		}
+		return userId;
 	}
 
 	/// <summary>

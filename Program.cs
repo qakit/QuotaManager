@@ -30,7 +30,7 @@ builder.Services.AddRazorPages();
 builder.Services.AddProxy(httpClientBuilder => httpClientBuilder.UseSocketsHttpHandler());
 builder.Services.AddSingleton<SessionHandler>();
 builder.Services.AddSingleton<QuotaManager>();
-builder.Services.AddSingleton<IWorkerPool>(sp => sp.GetRequiredService<QuotaManager>()); ;
+builder.Services.AddSingleton<IWorkerPool<Uri>>(sp => sp.GetRequiredService<QuotaManager>()); ;
 builder.Services.AddSingleton<IWorkerRegistry>(sp => sp.GetRequiredService<QuotaManager>());
 builder.Services.AddHostedService<LifecycleService>();
 builder.Services.AddHttpClient();
@@ -71,7 +71,7 @@ app.UseHttpsRedirection();
 app.UseStaticFiles();
 app.UseAuthorization();
 
-app.Map("/session", sessionHandler => sessionHandler.RunProxy<SessionHandler>());
+app.Map("/session", appBuilder => appBuilder.RunProxy<SessionHandler>());
 
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())

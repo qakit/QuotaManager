@@ -9,9 +9,17 @@ public class HostConfig
 	public int Limit { get; set; }
 }
 
+public class UserConfig
+{
+	public string Name { get; set; } = "";
+	public string Secret { get; set; } = "";
+	public int MaxSessions { get; set; } = 20;
+}
+
 public class AppConfig
 {
 	public List<HostConfig> Hosts { get; } = [];
+	public List<UserConfig> Users { get; } = [];
 
 	/// <summary>
 	/// Timeout for stopping host (grid).

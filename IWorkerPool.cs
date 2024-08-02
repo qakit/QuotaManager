@@ -1,30 +1,39 @@
 namespace GridQuota;
 
 public record Caps();
-public record Request(Caps Caps);
+public record Request(Caps Caps, int UserId);
 
-public class Worker : IDisposable
+/// <summary>
+/// Represents an access token for resource.
+/// </summary>
+public class ResourceToken<TResource>(TResource res, Action releaseResource) : IDisposable
 {
-    private readonly Action _setComplete;
-    public Uri Host { get; private set; }
+	private readonly Action _setComplete = releaseResource;
+	public TResource Resource { get; private set; } = res;
 
-    private Worker(Action setComplete, Uri host) { _setComplete = setComplete; Host = host; }
-    public void Dispose() => _setComplete?.Invoke();
-
-    public static Worker Create(Action setComplete, Uri host) => new(setComplete, host);
+	public void Dispose() => _setComplete?.Invoke();
 }
 
-public interface IWorkerPool
+/// <summary>
+/// Pool of workers holding particular resource type.
+/// </summary>
+/// <typeparam name="TResource"></typeparam>
+public interface IWorkerPool<TResource>
 {
-    Task<Worker> GetNext(Request req);
+	/// <summary>
+	/// Gets the pooled resource. You must release it after use so it gets back to the pool.
+	/// </summary>
+	/// <param name="req"></param>
+	/// <returns></returns>
+	Task<ResourceToken<TResource>> GetNext(Request req);
 }
 
 public interface IWorkerRegistry
 {
-    Task<bool> AddHost(HostConfig config);
-    Task<bool> DeleteHost(Uri config);
+	Task<bool> AddHost(HostConfig config);
+	Task<bool> DeleteHost(Uri config);
 
-    IEnumerable<Uri> RunningHosts { get; }
+	IEnumerable<Uri> RunningHosts { get; }
 
-    HostConfig[] GetConfig();
+	HostConfig[] GetConfig();
 }
