@@ -6,7 +6,7 @@ using ProxyKit;
 
 namespace GridQuota;
 
-public record SessionData(Uri Upstream, Uri HostUri, ResourceToken<Uri> Worker, TimeSpan SessionTimeout, int userId)
+public record SessionData(Uri Upstream, Uri HostUri, JobToken Job, TimeSpan SessionTimeout, int userId)
 {
 	// TODO userId/appId
 	public UpstreamHost UpstreamHost { get; } = new UpstreamHost(Upstream.AbsoluteUri);
@@ -14,9 +14,8 @@ public record SessionData(Uri Upstream, Uri HostUri, ResourceToken<Uri> Worker, 
 
 public class SessionHandler(
 	ILogger<SessionHandler> _logger,
-	IWorkerPool<Uri> balancer,
+	IWorkerPool balancer,
 	IHttpClientFactory _factory,
-	QuotaManager quotas,
 	IOptions<AppConfig> config) : IProxyHandler
 {
 	/// <summary>
@@ -24,7 +23,7 @@ public class SessionHandler(
 	/// </summary>
 	private const int DeleteSessionTimeoutMs = 4000;
 
-	private readonly IWorkerPool<Uri> _balancer = balancer;
+	private readonly IWorkerPool _balancer = balancer;
 
 	private readonly IDictionary<string, SessionData> _sessions = new ConcurrentDictionary<string, SessionData>();
 	private readonly ConcurrentDictionary<string, DateTimeOffset> _sessionsExpires = new();
@@ -119,8 +118,7 @@ public class SessionHandler(
 	{
 		if (_sessions.Remove(sessionId, out var sessionData))
 		{
-			quotas.ReleaseQuota(sessionData.userId);
-			sessionData.Worker.Dispose();
+			sessionData.Job.Dispose();
 			_sessionsExpires.Remove(sessionId, out var _);
 			// TODO consider _registry.ReleaseHost(sessionData.Host)
 		}
@@ -211,12 +209,21 @@ public class SessionHandler(
 		}
 
 		var caps = new Caps();
-		await quotas.AwaitQuota(userId, context.RequestAborted);
 
 		do
 		{
-			var workerToken = await _balancer.GetNext(new Request(caps, userId));
-			var host = workerToken.Resource.AbsoluteUri;
+			JobToken jobToken;
+			try
+			{
+				jobToken = await _balancer.GetNext(new Request(caps, userId), context.RequestAborted);
+			}
+			catch (Exception e)
+			{
+				_logger.LogError("Failed to get next worker: {Error}", e.Message);
+				return new HttpResponseMessage(System.Net.HttpStatusCode.InternalServerError);
+			}
+
+			var host = jobToken.Worker.HostUri.AbsoluteUri;
 			var sessionEndpoint = new Uri(new Uri(host.TrimEnd('/') + "/"), "session");
 
 			HttpResponseMessage? initResponse = null;
@@ -238,7 +245,7 @@ public class SessionHandler(
 				var sessionId = seleniumResponse.RootElement.GetProperty("value").GetProperty("sessionId")
 					.GetString() ?? "";
 
-				_logger.LogInformation("New session for {Remote} user {User}: {SessionId} on host '{WorkerHost}'", context.Connection.RemoteIpAddress, userId, sessionId, workerToken.Resource);
+				_logger.LogInformation("New session for {Remote} user {User}: {SessionId} on host '{WorkerHost}'", context.Connection.RemoteIpAddress, userId, sessionId, jobToken.Worker.HostUri);
 
 				var updatedBody = FixupInitResponse(responseBody, context.Connection);
 				if (updatedBody != responseBody)
@@ -246,14 +253,14 @@ public class SessionHandler(
 					initResponse.Content = new StringContent(updatedBody, Encoding.UTF8, "application/json");
 				}
 
-				_sessions.Add(sessionId, new SessionData(sessionEndpoint, workerToken.Resource, workerToken, config.Value.SessionTimeout, userId));
-				Touch(sessionId, workerToken.Resource);
+				_sessions.Add(sessionId, new SessionData(sessionEndpoint, jobToken.Worker.HostUri, jobToken, config.Value.SessionTimeout, userId));
+				Touch(sessionId, jobToken.Worker.HostUri);
 				return initResponse;
 			}
 			else if (--retriesLeft <= 0)
 			{
 				_logger.LogError("Failed to process /session request after 3 retries");
-				quotas.ReleaseQuota(userId);
+				jobToken.Dispose();
 
 				if(initResponse == null)
 				{
@@ -263,8 +270,8 @@ public class SessionHandler(
 			}
 			else
 			{
-				_logger.LogWarning("Failed to get response from {Host}, retrying in {RetryTimeout}s", workerToken.Resource, retryTimeout.TotalSeconds);
-				workerToken.Dispose();
+				_logger.LogWarning("Failed to get response from {Host}, retrying in {RetryTimeout}s", jobToken.Worker.HostUri, retryTimeout.TotalSeconds);
+				jobToken.Dispose();
 				// TODO host seems to become inactive, consider _registry.ReleaseHost(worker);
 				await Task.Delay(retryTimeout);
 			}

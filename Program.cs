@@ -31,7 +31,7 @@ builder.Services.AddProxy(httpClientBuilder => httpClientBuilder.UseSocketsHttpH
 builder.Services.AddSingleton<SessionHandler>();
 builder.Services.AddSingleton<QuotaManager>();
 builder.Services.AddSingleton<WorkerPool>();
-builder.Services.AddSingleton<IWorkerPool<Uri>>(sp => sp.GetRequiredService<WorkerPool>()); ;
+builder.Services.AddSingleton<IWorkerPool>(sp => sp.GetRequiredService<WorkerPool>());
 builder.Services.AddSingleton<IWorkerRegistry>(sp => sp.GetRequiredService<WorkerPool>());
 builder.Services.AddHostedService<LifecycleService>();
 builder.Services.AddHttpClient();
@@ -54,15 +54,15 @@ if (app.Environment.IsDevelopment())
 app.UseWebSockets();
 
 app.UseWebSocketProxy(context =>
-{
-	Log.Debug("WebSocket request received. Path: {Path}, Protocol: {Protocol}, Origin: {Origin}",
-		context.Request.Path, context.WebSockets.WebSocketRequestedProtocols, context.Request.Headers["Origin"]);
+	{
+		Log.Debug("WebSocket request received. Path: {Path}, Protocol: {Protocol}, Origin: {Origin}",
+			context.Request.Path, context.WebSockets.WebSocketRequestedProtocols, context.Request.Headers["Origin"]);
 
-	var host = app.Services.GetRequiredService<IOptions<AppConfig>>().Value.Hosts.Single();
-	var hostUri = new Uri(host.HostUri);
+		var host = app.Services.GetRequiredService<IOptions<AppConfig>>().Value.Hosts.Single();
+		var hostUri = new Uri(host.HostUri);
 
-	return new Uri("ws://" + hostUri.Host + ":" + hostUri.Port);
-},
+		return new Uri("ws://" + hostUri.Host + ":" + hostUri.Port);
+	},
 	options => options.AddXForwardedHeaders());
 
 
@@ -74,9 +74,9 @@ app.UseAuthorization();
 
 app.Map("/session", appBuilder => appBuilder.RunProxy<SessionHandler>());
 
-app.MapGet("/stats", (QuotaManager manager) =>
+app.MapGet("/stats", (QuotaManager manager, WorkerPool workerPool) =>
 {
-	var stats = manager.GetStats();
+	var stats = new AppStatsPayload(manager.GetStats(), workerPool.GetStats());
 	return Results.Json(stats);
 });
 
@@ -115,3 +115,5 @@ catch (Exception ex)
 	Log.Fatal(ex, "Application terminated unexpectedly");
 	return 1;
 }
+
+public record AppStatsPayload(QuotaStatsPayload Quota, WorkerStatsPayload Workers);

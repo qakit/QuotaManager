@@ -1,38 +1,69 @@
 using System.Collections.Concurrent;
 using System.Threading.Channels;
-using Microsoft.Extensions.Options;
 
 namespace GridQuota;
 
-public record HostData(Uri HostUri, HostConfig Config, CancellationTokenSource Cts, Task[] Runners);
+public record WorkerStatsPayload(int WorkerPoolSize, int WorkerQueueSize);
 
-public class WorkerPool(ILogger<WorkerPool> _logger, IOptions<AppConfig> _appConfig) : IWorkerPool<Uri>, IWorkerRegistry
+
+public class WorkerPool(ILogger<WorkerPool> _logger, QuotaManager quotas) : IWorkerPool, IWorkerRegistry
 {
-	const int MaxWorkerPerHost = 10000;
-
-	/// <summary>
-	/// Represents a single unit of work.
-	/// </summary>
-	private class Ticket<TJob,TResource>(TJob job)
+	private class WorkerData
 	{
-		private readonly TaskCompletionSource<ResourceToken<TResource>> _workerAwaitToken = new();
+		private readonly TaskCompletionSource _workerStop = new();
 
-		public TJob Job { get; private set; } = job;
-		public Task<ResourceToken<TResource>> AwaitResourceToken() => _workerAwaitToken.Task;
-		public void ProcessWith(ResourceToken<TResource> worker) => _workerAwaitToken.SetResult(worker);
+		public required WorkerInfo Info { get; init; }
+		public bool IsRunning { get; private set; } = true;
+		public void Stop() { IsRunning = false; _workerStop.SetResult(); }
+
+		public async Task AwaitCompletion(CancellationToken cancel)
+		{
+			if(IsRunning) await _workerStop.Task;
+		}
 	}
 
-	private readonly Channel<Ticket<Request, Uri>> _queue = Channel.CreateUnbounded<Ticket<Request, Uri>>();
+	private record HostData(Uri HostUri, HostConfig Config, List<WorkerData> Workers);
+
+	const int MaxWorkerPerHost = 10000;
+
+	private readonly Channel<WorkerData> _workerQueue = Channel.CreateUnbounded<WorkerData>();
+
 	private readonly ConcurrentDictionary<Uri, HostData> _runningHosts = new();
 
 	#region IWorkerPool
 
-	public async Task<ResourceToken<Uri>> GetNext(Request req)
-	{
-		var ticket = new Ticket<Request, Uri>(req);
-		await _queue.Writer.WriteAsync(ticket);
+	/// <summary>
+	/// Semaphore to ensure only one thread is reading from the queue at a time.
+	/// </summary>
+	private readonly SemaphoreSlim _queueReadSemaphore = new(1, 1);
 
-		return await ticket.AwaitResourceToken();
+	public async Task<JobToken> GetNext(Request req, CancellationToken cancel)
+	{
+		await quotas.AwaitQuota(req.UserId, cancel);
+
+		var reader = _workerQueue.Reader;
+
+		try
+		{
+			await _queueReadSemaphore.WaitAsync(cancel);
+			while (true)
+			{
+				var worker = await reader.ReadAsync(cancel);
+				if(!worker.IsRunning) continue;
+
+				return new JobToken(worker.Info, req, job => ReleaseJob(job, worker));
+			}
+		}
+		finally
+		{
+			_queueReadSemaphore.Release();
+		}
+	}
+
+	private void ReleaseJob(JobToken job, WorkerData worker)
+	{
+		quotas.ReleaseQuota(job.Request.UserId);
+		if(worker.IsRunning) _workerQueue.Writer.TryWrite(worker);
 	}
 
 	#endregion
@@ -47,12 +78,21 @@ public class WorkerPool(ILogger<WorkerPool> _logger, IOptions<AppConfig> _appCon
 		await DeleteHost(hostUri);
 		_logger.LogInformation("Connecting to host/grid '{hostUri}'", hostUri);
 
+		var writer = _workerQueue.Writer;
+
 		// start or updates tasks for a specific host
-		var cts = new CancellationTokenSource();
-		var hostInfo = new HostData(hostUri, config, cts, StartHost(config, cts.Token));
+		var workerCount = Math.Min(Math.Max(1, config.Limit), MaxWorkerPerHost);
+		var workerInfo = new WorkerInfo(hostUri);
+		var workers = Enumerable.Range(0, workerCount).Select(_ => new WorkerData { Info = workerInfo }).ToList();
 
 		// TODO sync access
-		_runningHosts.TryAdd(hostUri, hostInfo);
+		if(_runningHosts.TryAdd(hostUri, new HostData(hostUri, config, workers)))
+		{
+			foreach (var worker in workers)
+			{
+				await writer.WriteAsync(worker);
+			}
+		}
 		return true;
 	}
 	public async Task<bool> DeleteHost(Uri host)
@@ -60,22 +100,9 @@ public class WorkerPool(ILogger<WorkerPool> _logger, IOptions<AppConfig> _appCon
 		if (_runningHosts.TryRemove(host, out var hostInfo))
 		{
 			_logger.LogInformation("Disconnecting from host/grid '{host}'", host);
-			hostInfo.Cts.Cancel();
+			hostInfo.Workers.ForEach(w => w.Stop()); // that simply sets a flag for worker not to be re-added to queue.
+			await Task.WhenAll(hostInfo.Workers.Select(w => w.AwaitCompletion(CancellationToken.None)));
 
-			var timeout = Task.Delay(_appConfig.Value.StopHostTimeout);
-			var timeoutExpired = await Task.WhenAny(
-				timeout,
-				Task.WhenAll(hostInfo.Runners)) == timeout;
-
-			if (timeoutExpired)
-			{
-				_logger.LogError("Failed to stop '{host}' gracefully", host);
-				// TODO force stopping agent
-			}
-			else
-			{
-				_logger.LogInformation("Stopped host '{host}'", host);
-			}
 			return true;
 		}
 		return false;
@@ -85,41 +112,12 @@ public class WorkerPool(ILogger<WorkerPool> _logger, IOptions<AppConfig> _appCon
 
 	#endregion
 
-	private Task[] StartHost(HostConfig config, CancellationToken cancel)
+
+	public WorkerStatsPayload GetStats()
 	{
-		var hostUri = new Uri(config.HostUri);
-		var limit = Math.Min(Math.Max(1, config.Limit), MaxWorkerPerHost);
+		var workerPoolSize = _runningHosts.Values.Sum(h => h.Workers.Count);
+		var workerQueueSize = _workerQueue.Reader.Count;
 
-		var processingPool = new Task[limit];
-		for (int i = 0; i < limit; i++)
-		{
-			processingPool[i] = CreateHostWorker(hostUri, cancel);
-		}
-		return processingPool;
-	}
-
-	private async Task CreateHostWorker(Uri hostUri, CancellationToken cancel)
-	{
-		var inputQueue = _queue.Reader;
-		try
-		{
-			while (!cancel.IsCancellationRequested)
-			{
-				var canRead = await inputQueue.WaitToReadAsync(cancel);
-				if (canRead && inputQueue.TryRead(out var ticket))
-				{
-					var processingComplete = new TaskCompletionSource<bool>();
-					var resourceToken = new ResourceToken<Uri>(hostUri, () => processingComplete.SetResult(true));
-					ticket.ProcessWith(resourceToken);
-
-					// processing is started right away
-					await processingComplete.Task;
-				}
-			}
-		}
-		catch (TaskCanceledException)
-		{
-			_logger.LogWarning("Worker for '{Host}' cancelled", hostUri);
-		}
+		return new WorkerStatsPayload(workerPoolSize, workerQueueSize);
 	}
 }
