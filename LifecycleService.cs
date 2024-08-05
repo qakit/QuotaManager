@@ -1,14 +1,14 @@
 using System.Text.Json;
 using Microsoft.Extensions.Options;
 
-namespace GridQuota;
+namespace SeleniumSwissKnife;
 
 public class LifecycleService(
 	IOptionsMonitor<AppConfig> _configOptions,
 	IWorkerRegistry _balancer,
 	IHttpClientFactory _clientFactory,
 	ILogger<LifecycleService> _logger,
-	SessionHandler _sessionHandler
+	SessionProxyHandler _sessionHandler
 ) : IHostedService
 {
 	private readonly CancellationTokenSource _watchdogsCts = new();
@@ -70,11 +70,11 @@ public class LifecycleService(
 
 	private async Task SyncConfig(CancellationToken _)
 	{
-		var runningHosts = _balancer.GetConfig().ToDictionary(c => new Uri(c.HostUri), c => c);
+		var runningHosts = _balancer.GetConfig().ToDictionary(c => c.HostUri, c => c);
 		var newConfig = _configOptions.CurrentValue;
-		var newHosts = newConfig.Hosts.ToDictionary(c => new Uri(c.HostUri), c => c);
+		var newHosts = newConfig.Hosts.ToDictionary(c => c.HostUri, c => c);
 
-		var hostsStatus = await CheckAliveStatus(from h in newConfig.Hosts select new Uri(h.HostUri));
+		var hostsStatus = await CheckAliveStatus(from h in newConfig.Hosts select h.HostUri);
 		Predicate<Uri> isAlive = uri =>
 			hostsStatus.TryGetValue(uri, out var x) && x
 			&& newHosts.TryGetValue(uri, out var config) && config.Limit > 0;

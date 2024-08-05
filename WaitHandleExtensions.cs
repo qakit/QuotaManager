@@ -1,4 +1,4 @@
-namespace GridQuota;
+namespace SeleniumSwissKnife;
 
 public static class WaitHandleExtensions
 {
