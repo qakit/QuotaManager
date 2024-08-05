@@ -1,9 +1,8 @@
-namespace GridQuota;
+namespace SeleniumSwissKnife;
 
 public record Caps();
 public record Request(Caps Caps, int UserId);
 public record WorkerInfo(Uri HostUri);
-
 
 /// <summary>
 /// Represents an access token for resource.
@@ -15,7 +14,6 @@ public class JobToken(WorkerInfo worker, Request request, Action<JobToken> onDis
 
 	public void Dispose() => onDispose?.Invoke(this);
 }
-
 
 /// <summary>
 /// Pool of workers holding particular resource type.

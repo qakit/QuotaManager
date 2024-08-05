@@ -2,6 +2,7 @@ using ProxyKit;
 using Serilog;
 using GridQuota;
 using Microsoft.Extensions.Options;
+using SeleniumSwissKnife;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -28,7 +29,7 @@ builder.Services.AddControllers();
 builder.Services.AddRazorPages();
 
 builder.Services.AddProxy(httpClientBuilder => httpClientBuilder.UseSocketsHttpHandler());
-builder.Services.AddSingleton<SessionHandler>();
+builder.Services.AddSingleton<SessionProxyHandler>();
 builder.Services.AddSingleton<QuotaManager>();
 builder.Services.AddSingleton<WorkerPool>();
 builder.Services.AddSingleton<IWorkerPool>(sp => sp.GetRequiredService<WorkerPool>());
@@ -38,6 +39,7 @@ builder.Services.AddHttpClient();
 builder.Services.AddControllers();
 
 var app = builder.Build();
+var logger = app.Services.GetRequiredService<ILogger<AppConfig>>();
 
 if (app.Environment.IsDevelopment())
 {
@@ -45,7 +47,7 @@ if (app.Environment.IsDevelopment())
 	{
 		if (context.WebSockets.IsWebSocketRequest)
 		{
-			Log.Debug("(WS) WebSocket request received on path: {Path}", context.Request.Path);
+			logger.LogDebug("(WS) WebSocket request received on path: {Path}", context.Request.Path);
 		}
 		return next(context);
 	});
@@ -55,25 +57,37 @@ app.UseWebSockets();
 
 app.UseWebSocketProxy(context =>
 	{
-		Log.Debug("WebSocket request received. Path: {Path}, Protocol: {Protocol}, Origin: {Origin}",
-			context.Request.Path, context.WebSockets.WebSocketRequestedProtocols, context.Request.Headers["Origin"]);
+		logger.LogDebug("WebSocket request received. Path: {Path}", context.Request.Path);
 
+		// TODO identify target by session ID~
 		var host = app.Services.GetRequiredService<IOptions<AppConfig>>().Value.Hosts.Single();
-		var hostUri = new Uri(host.HostUri);
-
-		return new Uri("ws://" + hostUri.Host + ":" + hostUri.Port);
+		return new Uri("ws://" + host.HostUri.Host + ":" + host.HostUri.Port);
 	},
 	options => options.AddXForwardedHeaders());
 
 
-app.UseSerilogRequestLogging(); // Add this line to log HTTP requests
+// app.UseSerilogRequestLogging(); // Add this line to log HTTP requests
 
 app.UseHttpsRedirection();
 app.UseStaticFiles();
 app.UseAuthorization();
 
-app.Map("/session", appBuilder => appBuilder.RunProxy<SessionHandler>());
+// Forwarding /status and /ui endpoints to the first host so that general stats are available via proxy.
+foreach(var path in new string[] {"/status", "/ui", "/graphql"})
+{
+	app.Map(path, app1 => 
+	{
+		app1.RunProxy(context => {
+			var hostUri = context.RequestServices.GetRequiredService<IOptions<AppConfig>>().Value.Hosts.First().HostUri;
+			return context.ForwardTo(new Uri(hostUri, path)).AddXForwardedHeaders().Send();
+		});
+	});
+}
 
+// main endpoint for processing Selenium sessions
+app.Map("/session", appBuilder => appBuilder.RunProxy<SessionProxyHandler>());
+
+// Expose our own stats.
 app.MapGet("/stats", (QuotaManager manager, WorkerPool workerPool) =>
 {
 	var stats = new AppStatsPayload(manager.GetStats(), workerPool.GetStats());
@@ -89,19 +103,21 @@ if (app.Environment.IsDevelopment())
 app.MapControllers();
 app.MapRazorPages();
 
+logger.LogDebug("You will see Debug messages and higher");
+
 app.Lifetime.ApplicationStarted.Register(() =>
 {
-	Log.Information("Web server is running and bound to the following addresses:");
+	logger.LogInformation("Web server is running and bound to the following addresses:");
 	foreach (var address in app.Urls)
 	{
-		Log.Information("    {Address}", address);
+		logger.LogInformation("    {Address}", address);
 	}
 });
 
 
 app.Lifetime.ApplicationStopping.Register(() =>
 {
-	Log.Information("Application is stopping");
+	logger.LogInformation("Application is stopping");
 	Log.CloseAndFlush();
 });
 
@@ -112,7 +128,7 @@ try
 }
 catch (Exception ex)
 {
-	Log.Fatal(ex, "Application terminated unexpectedly");
+	logger.LogError(ex, "Application terminated unexpectedly");
 	return 1;
 }
 

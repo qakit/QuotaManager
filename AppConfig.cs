@@ -1,12 +1,12 @@
-namespace GridQuota;
+namespace SeleniumSwissKnife;
 
 using System;
 using System.Collections.Generic;
 
 public class HostConfig
 {
-	public string HostUri { get; set; } = "";
-	public int Limit { get; set; }
+	public required Uri HostUri { get; set; }
+	public int Limit { get; set; } = 10;
 }
 
 public class UserConfig
